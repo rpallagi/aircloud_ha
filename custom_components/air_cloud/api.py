@@ -40,7 +40,7 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 COMMAND_TIMEOUT = aiohttp.ClientTimeout(total=15)
 WS_CONNECT_TIMEOUT = aiohttp.ClientTimeout(total=60)
 CACHE_TTL_POLLING: float = 15.0     # one-shot reads while no push listener is up
-CACHE_TTL_PUSH: float = 120.0       # sanity re-read interval while push is healthy
+CACHE_TTL_PUSH: float = 60.0        # re-read interval while push is healthy (cloud pushes are unreliable)
 LISTENER_HEARTBEAT: float = 8.0     # STOMP client heart-beat (server asked for 10 s)
 LISTENER_IDLE_TIMEOUT: float = 45.0 # no frame (not even a heart-beat) -> reconnect
 LISTENER_BACKOFF_MIN: float = 5.0
