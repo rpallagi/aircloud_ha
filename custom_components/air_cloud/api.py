@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -33,6 +34,17 @@ _LOGGER = logging.getLogger(__name__)
 NO_HUMIDITY_VALUE: int = 2_147_483_647
 ENERGY_SUMMARY_CACHE_SECONDS: float = 3600.0
 ENERGY_SUMMARY_RATE_LIMIT_SECONDS: float = 1800.0
+
+# REST / WS timing
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+COMMAND_TIMEOUT = aiohttp.ClientTimeout(total=15)
+WS_CONNECT_TIMEOUT = aiohttp.ClientTimeout(total=60)
+CACHE_TTL_POLLING: float = 15.0     # one-shot reads while no push listener is up
+CACHE_TTL_PUSH: float = 120.0       # sanity re-read interval while push is healthy
+LISTENER_HEARTBEAT: float = 8.0     # STOMP client heart-beat (server asked for 10 s)
+LISTENER_IDLE_TIMEOUT: float = 45.0 # no frame (not even a heart-beat) -> reconnect
+LISTENER_BACKOFF_MIN: float = 5.0
+LISTENER_BACKOFF_MAX: float = 60.0
 
 DEFAULT_POWER = "OFF"
 DEFAULT_MODE = "COOLING"
@@ -70,11 +82,139 @@ class AirCloudApi:
         self._energy_summary_cache: dict[int, dict[str, Any]] = {}
         self._energy_summary_timestamps: dict[int, float] = {}
         self._energy_summary_rate_limited_until: dict[int, float] = {}
-        self._session = aiohttp.ClientSession()
+        self._session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
 
         self._update_locks: dict[int, asyncio.Lock] = {}
         self._update_timestamps: dict[int, float] = {}
         self._energy_summary_locks: dict[int, asyncio.Lock] = {}
+
+        # persistent push listener (one per family)
+        self._subscribers: dict[int, list[Callable[[list[dict[str, Any]]], None]]] = {}
+        self._listener_tasks: dict[int, asyncio.Task] = {}
+        self._listener_connected: dict[int, bool] = {}
+        self._listener_messages: dict[int, int] = {}
+
+    # ------------------------------------------------------------- push API
+    def subscribe(
+        self,
+        family_id: int,
+        callback: Callable[[list[dict[str, Any]]], None],
+    ) -> Callable[[], None]:
+        """Register a callback for fresh device data of a family.
+
+        Starts the persistent STOMP listener for that family on first use.
+        Returns an unsubscribe function.
+        """
+        self._subscribers.setdefault(family_id, []).append(callback)
+        task = self._listener_tasks.get(family_id)
+        if task is None or task.done():
+            self._listener_tasks[family_id] = asyncio.get_running_loop().create_task(
+                self._listener_loop(family_id),
+                name=f"air_cloud listener {family_id}",
+            )
+
+        def _unsub() -> None:
+            subs = self._subscribers.get(family_id, [])
+            if callback in subs:
+                subs.remove(callback)
+
+        return _unsub
+
+    def listener_healthy(self, family_id: int) -> bool:
+        return self._listener_connected.get(family_id, False)
+
+    def _notify(self, family_id: int, devices: list[dict[str, Any]]) -> None:
+        for cb in list(self._subscribers.get(family_id, [])):
+            try:
+                cb(devices)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("AirCloud: subscriber callback failed: %s", exc)
+
+    def _parse_ws_message(self, raw: str) -> list[dict[str, Any]] | None:
+        json_part = "{" + raw.partition("{")[2].replace("\0", "")
+        try:
+            struct = json.loads(json_part)
+        except json.JSONDecodeError as exc:
+            _LOGGER.warning("AirCloud: failed to parse WS JSON: %s", exc)
+            return None
+        return struct.get("data") or []
+
+    def _store_devices(self, family_id: int, devices: list[dict[str, Any]]) -> None:
+        for device in devices:
+            dev_id = device.get("id")
+            if dev_id is not None:
+                self._device_cache[dev_id] = device
+                self._device_family[dev_id] = family_id
+        self._update_timestamps[family_id] = asyncio.get_running_loop().time()
+
+    async def _listener_loop(self, family_id: int) -> None:
+        backoff = LISTENER_BACKOFF_MIN
+        while not self._session.closed:
+            hb_task: asyncio.Task | None = None
+            try:
+                await self._refresh_token()
+                async with self._session.ws_connect(
+                    URN_WSS,
+                    timeout=WS_CONNECT_TIMEOUT,
+                    headers={"User-Agent": USER_AGENT},
+                ) as ws:
+                    await ws.send_str(self._build_stomp_connect(family_id))
+                    hb_task = asyncio.get_running_loop().create_task(self._heartbeat(ws))
+                    while True:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=LISTENER_IDLE_TIMEOUT)
+                        if msg.type == WSMsgType.TEXT:
+                            data = msg.data
+                            if data.startswith("CONNECTED"):
+                                if "user-name:" not in data:
+                                    _LOGGER.warning("AirCloud: push listener auth rejected, re-authenticating")
+                                    await self._refresh_token(forced=True)
+                                    break
+                                self._listener_connected[family_id] = True
+                                backoff = LISTENER_BACKOFF_MIN
+                                _LOGGER.info("AirCloud: push listener connected (family %s)", family_id)
+                            elif data.startswith("MESSAGE") and "{" in data:
+                                devices = self._parse_ws_message(data)
+                                if devices:
+                                    self._store_devices(family_id, devices)
+                                    self._listener_messages[family_id] = (
+                                        self._listener_messages.get(family_id, 0) + 1
+                                    )
+                                    _LOGGER.debug(
+                                        "AirCloud: push #%d for family %s (%d devices)",
+                                        self._listener_messages[family_id], family_id, len(devices),
+                                    )
+                                    self._notify(family_id, devices)
+                            elif data.startswith("ERROR"):
+                                _LOGGER.warning("AirCloud: push listener STOMP error: %s", data[:200])
+                                break
+                            # heart-beats ("\n") and RECEIPT frames are ignored
+                        elif msg.type in (WSMsgType.CLOSED, WSMsgType.CLOSING, WSMsgType.ERROR):
+                            _LOGGER.debug("AirCloud: push listener socket closed (%s)", msg.type)
+                            break
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                _LOGGER.debug("AirCloud: push listener idle timeout, reconnecting")
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("AirCloud: push listener error: %s", exc)
+            finally:
+                self._listener_connected[family_id] = False
+                if hb_task:
+                    hb_task.cancel()
+            if self._session.closed:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, LISTENER_BACKOFF_MAX)
+
+    async def _heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        try:
+            while not ws.closed:
+                await asyncio.sleep(LISTENER_HEARTBEAT)
+                await ws.send_str("\n")
+        except (asyncio.CancelledError, ConnectionResetError, RuntimeError):
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("AirCloud: heartbeat stopped: %s", exc)
 
     def _get_update_lock(self, family_id: int) -> asyncio.Lock:
         if family_id not in self._update_locks:
@@ -142,17 +282,22 @@ class AirCloudApi:
             data = await resp.json(content_type=None)
         return [item["familyId"] for item in data]
 
-    async def load_climate_data(self, family_id: int, force: bool = False) -> list[dict[str, Any]]:
+    def _cache_is_fresh(self, family_id: int, force: bool) -> bool:
         now = asyncio.get_running_loop().time()
-        last_update = self._update_timestamps.get(family_id, 0.0)
-        if not force and (now - last_update) < 15.0:
+        age = now - self._update_timestamps.get(family_id, 0.0)
+        if self.listener_healthy(family_id):
+            # push keeps the cache current; a forced read right after a command
+            # is redundant if a push already arrived in the last few seconds
+            return age < (CACHE_TTL_POLLING if force else CACHE_TTL_PUSH)
+        return (not force) and age < CACHE_TTL_POLLING
+
+    async def load_climate_data(self, family_id: int, force: bool = False) -> list[dict[str, Any]]:
+        if self._cache_is_fresh(family_id, force):
             return self._get_cached_family_devices(family_id)
 
         lock = self._get_update_lock(family_id)
         async with lock:
-            now = asyncio.get_running_loop().time()
-            last_update = self._update_timestamps.get(family_id, 0.0)
-            if not force and (now - last_update) < 15.0:
+            if self._cache_is_fresh(family_id, force):
                 return self._get_cached_family_devices(family_id)
 
             if self._session.closed:
@@ -163,12 +308,12 @@ class AirCloudApi:
             try:
                 async with self._session.ws_connect(
                     URN_WSS,
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    timeout=WS_CONNECT_TIMEOUT,
                     headers={"User-Agent": USER_AGENT},
                 ) as ws:
                     await ws.send_str(self._build_stomp_connect(family_id))
                     raw = await self._recv_stomp_message(ws, family_id)
-            except Exception as exc: 
+            except Exception as exc:
                 _LOGGER.warning("AirCloud: WebSocket error: %s", exc)
                 return self._get_cached_family_devices(family_id)
 
@@ -176,22 +321,15 @@ class AirCloudApi:
                 return self._get_cached_family_devices(family_id)
 
             _LOGGER.debug("AirCloud: received WS data for family %s", family_id)
-            json_part = "{" + raw.partition("{")[2].replace("\0", "")
-            try:
-                struct = json.loads(json_part)
-            except json.JSONDecodeError as exc:
-                _LOGGER.warning("AirCloud: failed to parse WS JSON: %s", exc)
+            devices = self._parse_ws_message(raw)
+            if devices is None:
                 return self._get_cached_family_devices(family_id)
 
-            devices: list[dict[str, Any]] = struct.get("data") or []
-            for device in devices:
-                dev_id = device.get("id")
-                if dev_id is not None:
-                    self._device_cache[dev_id] = device
-                    self._device_family[dev_id] = family_id
+            self._store_devices(family_id, devices)
 
-            self._update_timestamps[family_id] = asyncio.get_running_loop().time()
-            return devices
+        # outside the lock: fan the fresh snapshot out to every entity
+        self._notify(family_id, devices)
+        return devices
 
     def _get_cached_family_devices(self, family_id: int) -> list[dict[str, Any]]:
         return [
@@ -229,7 +367,7 @@ class AirCloudApi:
                     await self._refresh_token(forced=True)
                     async with self._session.ws_connect(
                         URN_WSS,
-                        timeout=aiohttp.ClientTimeout(total=60),
+                        timeout=WS_CONNECT_TIMEOUT,
                         headers={"User-Agent": USER_AGENT},
                     ) as new_ws:
                         await new_ws.send_str(self._build_stomp_connect(family_id))
@@ -447,16 +585,46 @@ class AirCloudApi:
         await self._put(url, payload)
 
     async def _put(self, url: str, payload: dict[str, Any]) -> None:
+        """PUT with a bounded timeout and one retry.
+
+        401 -> re-authenticate and retry; timeouts / 5xx / connection errors ->
+        retry once after a short pause. 4xx other than 401 is not retried.
+        """
         _LOGGER.debug("AirCloud: PUT %s  payload=%s", url, payload)
-        async with self._session.put(url, headers=self._headers(), json=payload) as resp:
-            body = await resp.text()
-            _LOGGER.debug("AirCloud: response status=%s body=%s", resp.status, body[:500])
-            if resp.status >= 400:
-                _LOGGER.error(
-                    "AirCloud: command failed status=%s url=%s payload=%s body=%s",
-                    resp.status, url, payload, body,
-                )
-            resp.raise_for_status()
+        last_exc: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                async with self._session.put(
+                    url, headers=self._headers(), json=payload, timeout=COMMAND_TIMEOUT
+                ) as resp:
+                    body = await resp.text()
+                    _LOGGER.debug("AirCloud: response status=%s body=%s", resp.status, body[:500])
+                    if resp.status == 401 and attempt == 1:
+                        _LOGGER.warning("AirCloud: PUT got 401, re-authenticating and retrying")
+                        await self._refresh_token(forced=True)
+                        continue
+                    if resp.status >= 400:
+                        _LOGGER.error(
+                            "AirCloud: command failed status=%s url=%s payload=%s body=%s",
+                            resp.status, url, payload, body,
+                        )
+                    if resp.status >= 500 and attempt == 1:
+                        last_exc = aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status, message=body[:200]
+                        )
+                        await asyncio.sleep(1.5)
+                        continue
+                    resp.raise_for_status()
+                    return
+            except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as exc:
+                last_exc = exc
+                if attempt == 1:
+                    _LOGGER.warning("AirCloud: PUT transient error (%s), retrying once", exc)
+                    await asyncio.sleep(1.5)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -467,6 +635,10 @@ class AirCloudApi:
         }
 
     async def close_session(self) -> None:
+        for task in self._listener_tasks.values():
+            task.cancel()
+        self._listener_tasks.clear()
+        self._listener_connected.clear()
         await self._session.close()
 
 def _get_sys_type(snapshot: dict[str, Any]) -> int | None:

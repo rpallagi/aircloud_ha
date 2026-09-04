@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.climate import ClimateEntity
@@ -12,6 +13,7 @@ from homeassistant.components.climate.const import (
     SWING_OFF,
     SWING_VERTICAL,
     ClimateEntityFeature,
+    HVACAction,
     HVACMode,
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
@@ -38,6 +40,23 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# --- Responsiveness tuning -------------------------------------------------
+# Commands are acknowledged to HA immediately (optimistic state) and sent to the
+# cloud in the background. While the "trust window" is open, stale cloud
+# snapshots are not allowed to overwrite the commanded values; the window closes
+# early as soon as the cloud reports the commanded state.
+#
+# Both values can be overridden at runtime (no restart) with these helpers:
+#   input_number.aircloud_trust_window    (seconds, default 30)
+#   input_number.aircloud_post_cmd_sleep  (seconds, default 8)
+TUNABLE_TRUST_WINDOW = "input_number.aircloud_trust_window"
+TUNABLE_POST_CMD_SLEEP = "input_number.aircloud_post_cmd_sleep"
+DEFAULT_TRUST_WINDOW = 45.0     # measured cloud apply latency: 10-50 s
+DEFAULT_POST_CMD_SLEEP = 10.0
+COMMAND_DEBOUNCE = 0.7          # coalesce rapid slider / group fan-out calls
+MAX_COMMAND_RETRIES = 1         # re-send once if the cloud never confirms
+REFRESH_TASKS = "refresh_tasks" # hass.data[DOMAIN][REFRESH_TASKS][family_id]
+
 RAW_TO_HVAC: dict[str, HVACMode] = {
     "COOLING": HVACMode.COOL,
     "HEATING": HVACMode.HEAT,
@@ -46,6 +65,13 @@ RAW_TO_HVAC: dict[str, HVACMode] = {
     "AUTO":    HVACMode.AUTO,
 }
 HVAC_TO_RAW: dict[HVACMode, str] = {v: k for k, v in RAW_TO_HVAC.items()}
+
+RAW_TO_ACTION: dict[str, HVACAction] = {
+    "COOLING": HVACAction.COOLING,
+    "HEATING": HVACAction.HEATING,
+    "DRY":     HVACAction.DRYING,
+    "FAN":     HVACAction.FAN,
+}
 
 RAW_TO_FAN: dict[str, str] = {
     "AUTO": FAN_AUTO,
@@ -135,11 +161,49 @@ class AirCloudClimateEntity(ClimateEntity):
         self._sys_type: int | None = None
         self._command_in_flight = False
 
+        # optimistic-command bookkeeping
+        self._trust_until: float = 0.0
+        self._desired: dict[str, Any] | None = None
+        self._pending: dict[str, Any] | None = None
+        self._dispatch_task: asyncio.Task | None = None
+        self._retries = 0
+        self._unsub_push = None
+
         self._apply_snapshot(device)
 
         self._attr_hvac_modes = self._build_hvac_modes()
         self._attr_fan_modes = self._build_fan_modes()
         self._attr_swing_modes = self._build_swing_modes()
+
+    # ------------------------------------------------------------------ push
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._unsub_push = self._api.subscribe(self._family_id, self._on_push)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_push:
+            self._unsub_push()
+            self._unsub_push = None
+        await super().async_will_remove_from_hass()
+
+    def _on_push(self, devices: list[dict[str, Any]]) -> None:
+        """Called by the API (in the event loop) whenever fresh family data arrives."""
+        for device in devices:
+            if device.get("id") == self._device_id:
+                self._apply_snapshot(device)
+                if self.hass is not None and self.entity_id:
+                    self.async_write_ha_state()
+                break
+
+    # --------------------------------------------------------------- helpers
+    def _tunable(self, entity_id: str, default: float, lo: float, hi: float) -> float:
+        try:
+            state = self._hass.states.get(entity_id)
+            if state is None or state.state in ("unknown", "unavailable", ""):
+                return default
+            return max(lo, min(hi, float(state.state)))
+        except (TypeError, ValueError, AttributeError):
+            return default
 
     def _build_hvac_modes(self) -> list[HVACMode]:
         modes = [HVACMode.OFF]
@@ -169,29 +233,98 @@ class AirCloudClimateEntity(ClimateEntity):
                 modes.append(RAW_TO_SWING[raw])
         return modes
 
+    def _target_from_snapshot(self, snapshot: dict[str, Any], mode: str) -> float:
+        settings = self._mode_settings_for(mode)
+        is_relative = settings.get("temperature_setting", "ABSOLUTE") == "RELATIVE"
+        ref_temp = float(settings.get("reference_temperature", 0.0))
+        if is_relative and snapshot.get("relativeTemperature") not in (None, ""):
+            raw_t = float(snapshot.get("relativeTemperature", 0.0))
+            return self._clamp_temp(raw_t + ref_temp, mode)
+        if snapshot.get("iduTemperature") not in (None, ""):
+            raw_t = float(snapshot.get("iduTemperature", 24.0))
+            return self._clamp_temp(raw_t, mode)
+        return self._default_temp(mode)
+
+    def _snapshot_matches_desired(self, snapshot: dict[str, Any]) -> bool:
+        d = self._desired
+        if not d:
+            return True
+        power = str(snapshot.get("power", "")).upper()
+        mode = str(snapshot.get("mode", "")).upper()
+        if power != d["power"]:
+            return False
+        if power == "OFF":
+            # when off, the cloud may report any mode/fan; only power matters
+            return True
+        if mode != d["mode"]:
+            return False
+        if str(snapshot.get("fanSpeed", "")).upper() != d["fan_speed"]:
+            return False
+        if str(snapshot.get("fanSwing", "")).upper() != d["fan_swing"]:
+            return False
+        return abs(self._target_from_snapshot(snapshot, mode) - d["target_temp"]) < 0.05
+
     def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
         self._available = bool(
             snapshot.get("online", snapshot.get("isOnline", True))
         )
-        self._power = str(snapshot.get("power", self._power)).upper()
-        self._mode = str(snapshot.get("mode", self._mode)).upper()
-        self._fan_speed = str(snapshot.get("fanSpeed", self._fan_speed)).upper()
-        self._fan_swing = str(snapshot.get("fanSwing", self._fan_swing)).upper()
         self._sys_type = _get_sys_type(snapshot)
 
-        settings = self._mode_settings_for(self._mode)
-        is_relative = settings.get("temperature_setting", "ABSOLUTE") == "RELATIVE"
-        ref_temp = float(settings.get("reference_temperature", 0.0))
+        trusting = False
+        if self._desired is not None:
+            if self._snapshot_matches_desired(snapshot):
+                _LOGGER.debug(
+                    "AirCloud: device=%s cloud confirmed commanded state, closing trust window",
+                    self._device_id,
+                )
+                self._trust_until = 0.0
+                self._desired = None
+            elif time.monotonic() < self._trust_until:
+                trusting = True
+                _LOGGER.debug(
+                    "AirCloud: device=%s ignoring stale cloud snapshot during trust window "
+                    "(cloud power=%s mode=%s temp=%s fan=%s)",
+                    self._device_id, snapshot.get("power"), snapshot.get("mode"),
+                    snapshot.get("iduTemperature"), snapshot.get("fanSpeed"),
+                )
+            elif self._retries < MAX_COMMAND_RETRIES and self._pending is None:
+                # window expired and the cloud still shows something else:
+                # the command was probably dropped -> send it once more
+                self._retries += 1
+                _LOGGER.warning(
+                    "AirCloud: device=%s cloud did not confirm command within trust window "
+                    "(cloud power=%s mode=%s temp=%s), re-sending (retry %d/%d)",
+                    self._device_id, snapshot.get("power"), snapshot.get("mode"),
+                    snapshot.get("iduTemperature"), self._retries, MAX_COMMAND_RETRIES,
+                )
+                trusting = True
+                self._trust_until = time.monotonic() + self._tunable(
+                    TUNABLE_TRUST_WINDOW, DEFAULT_TRUST_WINDOW, 5.0, 300.0
+                )
+                self._pending = self._desired
+                if self._dispatch_task is None or self._dispatch_task.done():
+                    self._dispatch_task = self._hass.async_create_background_task(
+                        self._dispatch_loop(),
+                        name=f"air_cloud dispatch {self._device_id}",
+                    )
+            else:
+                _LOGGER.warning(
+                    "AirCloud: device=%s giving up on unconfirmed command, showing cloud state "
+                    "(cloud power=%s mode=%s temp=%s)",
+                    self._device_id, snapshot.get("power"), snapshot.get("mode"),
+                    snapshot.get("iduTemperature"),
+                )
+                self._trust_until = 0.0
+                self._desired = None
 
-        if is_relative and snapshot.get("relativeTemperature") not in (None, ""):
-            raw_t = float(snapshot.get("relativeTemperature", 0.0))
-            self._target_temp = self._clamp_temp(raw_t + ref_temp, self._mode)
-        elif snapshot.get("iduTemperature") not in (None, ""):
-            raw_t = float(snapshot.get("iduTemperature", 24.0))
-            self._target_temp = self._clamp_temp(raw_t, self._mode)
-        else:
-            self._target_temp = self._default_temp(self._mode)
+        if not trusting:
+            self._power = str(snapshot.get("power", self._power)).upper()
+            self._mode = str(snapshot.get("mode", self._mode)).upper()
+            self._fan_speed = str(snapshot.get("fanSpeed", self._fan_speed)).upper()
+            self._fan_swing = str(snapshot.get("fanSwing", self._fan_swing)).upper()
+            self._target_temp = self._target_from_snapshot(snapshot, self._mode)
 
+        # read-only fields always come from the cloud
         room_raw = snapshot.get("roomTemperature")
         if room_raw is not None:
             adjust = float(
@@ -289,6 +422,7 @@ class AirCloudClimateEntity(ClimateEntity):
                 return default
         return val
 
+    # -------------------------------------------------------------- commands
     async def _send_command(
         self,
         *,
@@ -298,6 +432,11 @@ class AirCloudClimateEntity(ClimateEntity):
         fan_speed: str | None = None,
         fan_swing: str | None = None,
     ) -> None:
+        """Apply the command optimistically and return immediately.
+
+        The cloud round trip runs in a background task (see _dispatch_loop);
+        rapid successive calls are coalesced into a single PUT.
+        """
         desired_mode = str(mode or self._mode or DEFAULT_MODE).upper()
         desired_power = (
             "ON" if str(power or self._power or DEFAULT_POWER).upper() == "ON" else "OFF"
@@ -310,44 +449,108 @@ class AirCloudClimateEntity(ClimateEntity):
         desired_swing = self._normalize_fan_swing(fan_swing)
         desired_humidity = self._command_humidity(desired_mode)
 
-        _LOGGER.debug(
-            "AirCloud: sending command device=%s power=%s mode=%s temp=%.1f fan=%s swing=%s hum=%s",
-            self._device_id, desired_power, desired_mode, desired_temp,
-            desired_fan, desired_swing, desired_humidity,
-        )
+        desired = {
+            "power": desired_power,
+            "mode": desired_mode,
+            "target_temp": desired_temp,
+            "fan_speed": desired_fan,
+            "fan_swing": desired_swing,
+            "humidity": desired_humidity,
+        }
 
-        self._command_in_flight = True
-        try:
-            await self._api.execute_command(
-                self._device_id,
-                self._family_id,
-                desired_power,
-                desired_temp,
-                desired_mode,
-                desired_fan,
-                desired_swing,
-                desired_humidity,
-            )
-        except Exception as exc: 
-            _LOGGER.error("AirCloud: command failed: %s", exc)
-        finally:
-            self._command_in_flight = False
-
+        # optimistic local state + trust window
         self._power = desired_power
         self._mode = desired_mode
         self._target_temp = desired_temp
         self._fan_speed = desired_fan
         self._fan_swing = desired_swing
+        self._desired = desired
+        self._retries = 0
+        self._trust_until = time.monotonic() + self._tunable(
+            TUNABLE_TRUST_WINDOW, DEFAULT_TRUST_WINDOW, 5.0, 300.0
+        )
         self.async_write_ha_state()
 
-        await asyncio.sleep(2)
-        devices = await self._api.load_climate_data(self._family_id, force=True)
-        for device in devices:
-            if device.get("id") == self._device_id:
-                self._apply_snapshot(device)
+        # coalesce + dispatch in background
+        self._pending = desired
+        if self._dispatch_task is None or self._dispatch_task.done():
+            self._dispatch_task = self._hass.async_create_background_task(
+                self._dispatch_loop(),
+                name=f"air_cloud dispatch {self._device_id}",
+            )
+
+    async def _dispatch_loop(self) -> None:
+        await asyncio.sleep(COMMAND_DEBOUNCE)
+        failed = False
+        while self._pending is not None:
+            cmd = self._pending
+            self._pending = None
+            self._command_in_flight = True
+            started = time.monotonic()
+            try:
+                await self._api.execute_command(
+                    self._device_id,
+                    self._family_id,
+                    cmd["power"],
+                    cmd["target_temp"],
+                    cmd["mode"],
+                    cmd["fan_speed"],
+                    cmd["fan_swing"],
+                    cmd["humidity"],
+                )
+                _LOGGER.info(
+                    "AirCloud: command sent device=%s power=%s mode=%s temp=%.1f fan=%s swing=%s (%.1fs)",
+                    self._device_id, cmd["power"], cmd["mode"], cmd["target_temp"],
+                    cmd["fan_speed"], cmd["fan_swing"], time.monotonic() - started,
+                )
+                failed = False
+            except Exception as exc:  # noqa: BLE001
+                failed = True
+                _LOGGER.error(
+                    "AirCloud: command FAILED device=%s power=%s mode=%s temp=%.1f: %s",
+                    self._device_id, cmd["power"], cmd["mode"], cmd["target_temp"], exc,
+                )
+            finally:
+                self._command_in_flight = False
+
+        if failed:
+            # stop trusting the optimistic state and show the real one ASAP
+            self._trust_until = 0.0
+            self._desired = None
+            self._schedule_family_refresh(1.0)
+        else:
+            self._schedule_family_refresh(
+                self._tunable(TUNABLE_POST_CMD_SLEEP, DEFAULT_POST_CMD_SLEEP, 2.0, 60.0)
+            )
+
+    def _schedule_family_refresh(self, delay: float) -> None:
+        """One debounced forced refresh per family, shared by all entities."""
+        store = self._hass.data.setdefault(DOMAIN, {}).setdefault(REFRESH_TASKS, {})
+        entry = store.get(self._family_id)
+        due = time.monotonic() + delay
+        if entry and not entry["task"].done():
+            entry["due"] = max(entry["due"], due)
+            return
+        entry = {"due": due, "task": None}
+        entry["task"] = self._hass.async_create_background_task(
+            self._family_refresh(entry),
+            name=f"air_cloud refresh family {self._family_id}",
+        )
+        store[self._family_id] = entry
+
+    async def _family_refresh(self, entry: dict[str, Any]) -> None:
+        while True:
+            remaining = entry["due"] - time.monotonic()
+            if remaining <= 0:
                 break
-        self.async_write_ha_state()
+            await asyncio.sleep(remaining)
+        try:
+            # api notifies every subscribed entity of this family itself
+            await self._api.load_climate_data(self._family_id, force=True)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("AirCloud: post-command refresh failed: %s", exc)
 
+    # ------------------------------------------------------------ properties
     @property
     def unique_id(self) -> str:
         return self._attr_unique_id
@@ -376,6 +579,8 @@ class AirCloudClimateEntity(ClimateEntity):
             "air_cloud_id": self._device_id,
             "cloud_id": self._cloud_id,
             "sys_type": self._sys_type,
+            "command_pending": self._desired is not None
+            and time.monotonic() < self._trust_until,
         }
 
     @property
@@ -424,6 +629,22 @@ class AirCloudClimateEntity(ClimateEntity):
         if self._power == "OFF":
             return HVACMode.OFF
         return RAW_TO_HVAC.get(self._mode, HVACMode.OFF)
+
+    @property
+    def hvac_action(self) -> HVACAction | None:
+        if self._power == "OFF":
+            return HVACAction.OFF
+        if self._mode in RAW_TO_ACTION:
+            return RAW_TO_ACTION[self._mode]
+        if self._mode == "AUTO":
+            if self._room_temp is None:
+                return None
+            return (
+                HVACAction.COOLING
+                if self._room_temp > self._target_temp
+                else HVACAction.HEATING
+            )
+        return None
 
     @property
     def hvac_modes(self) -> list[HVACMode]:
