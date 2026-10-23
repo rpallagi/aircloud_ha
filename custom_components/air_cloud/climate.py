@@ -52,6 +52,10 @@ _LOGGER = logging.getLogger(__name__)
 #   input_number.aircloud_post_cmd_sleep  (seconds, default 8)
 TUNABLE_TRUST_WINDOW = "input_number.aircloud_trust_window"
 TUNABLE_POST_CMD_SLEEP = "input_number.aircloud_post_cmd_sleep"
+# Fork note: when this input_boolean is "on" the entities advertise only OFF and
+# HEAT, so Home Assistant and HomeKit show a simple Off/Heat selector during the
+# heating season. Reload the HomeKit bridge after toggling it.
+TUNABLE_HEATING_ONLY = "input_boolean.aircloud_heating_only"
 DEFAULT_TRUST_WINDOW = 45.0     # measured cloud apply latency: 10-50 s
 DEFAULT_POST_CMD_SLEEP = 10.0
 COMMAND_DEBOUNCE = 0.7          # coalesce rapid slider / group fan-out calls
@@ -661,7 +665,16 @@ class AirCloudClimateEntity(ClimateEntity):
 
     @property
     def hvac_modes(self) -> list[HVACMode]:
+        if self._heating_only():
+            return [m for m in self._attr_hvac_modes if m in (HVACMode.OFF, HVACMode.HEAT)]
         return self._attr_hvac_modes
+
+    def _heating_only(self) -> bool:
+        try:
+            state = self._hass.states.get(TUNABLE_HEATING_ONLY)
+        except AttributeError:
+            return False
+        return state is not None and state.state == "on"
 
     @property
     def fan_mode(self) -> str:
