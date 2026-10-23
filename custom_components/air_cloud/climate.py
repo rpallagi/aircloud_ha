@@ -74,12 +74,16 @@ RAW_TO_ACTION: dict[str, HVACAction] = {
     "FAN":     HVACAction.FAN,
 }
 
+# Fork note: speed names must NOT be the HomeKit-predefined words low/middle/
+# medium/high (case-insensitive), otherwise HA's HomeKit bridge adds a fan
+# speed slider to the thermostat. With neutral names HA keeps full fan control
+# and HomeKit shows no fan speed control at all.
 RAW_TO_FAN: dict[str, str] = {
     "AUTO": FAN_AUTO,
     "LV1":  "Silent",
-    "LV2":  "Low",
-    "LV3":  "Medium",
-    "LV4":  "High",
+    "LV2":  "Low speed",
+    "LV3":  "Medium speed",
+    "LV4":  "High speed",
     "LV5":  "Turbo",
     "LV6":  "Turbo+",
     "LVA":  "Low-Auto",
@@ -446,6 +450,14 @@ class AirCloudClimateEntity(ClimateEntity):
             target_temp if target_temp is not None else self._target_temp,
             desired_mode,
         )
+        if fan_speed is None and desired_power == "ON" and self._power != "ON":
+            # Fork note: while OFF the cloud may report any stale fan speed; do not
+            # carry it into power-on, start on AUTO (falls back to the mode default
+            # where AUTO is not allowed, e.g. DRY/FAN).
+            fan_speed = DEFAULT_FAN_SPEED
+            _LOGGER.debug(
+                "AirCloud: device=%s power-on, resetting fan to %s", self._device_id, fan_speed
+            )
         desired_fan = self._normalize_fan_speed(fan_speed, desired_mode)
         desired_swing = self._normalize_fan_swing(fan_swing)
         desired_humidity = self._command_humidity(desired_mode)

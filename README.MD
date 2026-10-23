@@ -150,3 +150,10 @@ publish passwords or access/refresh tokens.
 See [tests/README.md](tests/README.md) for the offline regression suite. Tests use
 real aiohttp requests to localhost and Home Assistant boundary fixtures; they do
 not certify live cloud or physical air-conditioner behavior.
+
+
+## Fork notes (rpallagi/aircloud_ha, branch `responsive`)
+
+- Commands return immediately (optimistic state, background dispatch, trust window) so HomeKit never times out.
+- Fan speed names are `Silent`, `Low speed`, `Medium speed`, `High speed`: deliberately not the HomeKit-predefined words, so Home Assistant's HomeKit bridge shows **no fan speed slider** on the thermostats while Home Assistant keeps full fan control.
+- Turning a unit ON without an explicit fan speed always starts it on AUTO (mode default where AUTO is not allowed), instead of carrying a stale speed reported while OFF.
