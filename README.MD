@@ -158,3 +158,4 @@ not certify live cloud or physical air-conditioner behavior.
 - Fan speed names are `Silent`, `Low speed`, `Medium speed`, `High speed`: deliberately not the HomeKit-predefined words, so Home Assistant's HomeKit bridge shows **no fan speed slider** on the thermostats while Home Assistant keeps full fan control.
 - Turning a unit ON without an explicit fan speed always starts it on AUTO (mode default where AUTO is not allowed), instead of carrying a stale speed reported while OFF.
 - `input_boolean.aircloud_heating_only` = on → entities advertise only OFF and HEAT (simple Off/Heat selector in HA and HomeKit for the heating season; reload the HomeKit bridge after toggling).
+- Swing mode names are `off`, `Vertical swing`, `Horizontal swing`, `Both swing`: not HomeKit-predefined, so no fan service/tile appears in HomeKit at all; swing stays controllable in Home Assistant.

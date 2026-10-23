@@ -95,11 +95,14 @@ RAW_TO_FAN: dict[str, str] = {
 }
 FAN_TO_RAW: dict[str, str] = {v: k for k, v in RAW_TO_FAN.items()}
 
+# Fork note: swing names other than "off" must NOT be the HomeKit-predefined words
+# on/both/horizontal/vertical, otherwise HA's HomeKit bridge creates a fan service
+# (with a useless on/off switch) just to hold the swing toggle.
 RAW_TO_SWING: dict[str, str] = {
     "OFF":        SWING_OFF,
-    "VERTICAL":   SWING_VERTICAL,
-    "HORIZONTAL": SWING_HORIZONTAL,
-    "BOTH":       SWING_BOTH,
+    "VERTICAL":   "Vertical swing",
+    "HORIZONTAL": "Horizontal swing",
+    "BOTH":       "Both swing",
 }
 SWING_TO_RAW: dict[str, str] = {v: k for k, v in RAW_TO_SWING.items()}
 
